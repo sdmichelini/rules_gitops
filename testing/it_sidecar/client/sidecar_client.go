@@ -26,7 +26,13 @@ type K8STestSetup struct {
 	in  io.WriteCloser
 	out io.ReadCloser
 	er  io.ReadCloser
+
+	// ReadyCallback for custom setup after services are ready and before pre-test
+	ReadyCallback Callback
 }
+
+// Callback function type is invoked post-setup but pre-test
+type Callback func() error
 
 var setupCMD = flag.String("setup", "", "the path to the it setup command")
 
@@ -49,6 +55,13 @@ func (s *K8STestSetup) TestMain(m *testing.M) {
 			}
 		}()
 		s.before(wg)
+		if s.ReadyCallback != nil {
+			err := s.ReadyCallback()
+			if err != nil {
+				log.Fatal(err)
+			}
+		}
+
 		// Run tests.
 		return m.Run()
 	}())
@@ -76,8 +89,10 @@ func (s *K8STestSetup) before(wg *sync.WaitGroup) {
 	// so we do not need to close this ourselves.  We must also guarantee that all reads on this pipe are completed
 	// before calling wait, so the goroutines below must be canceled before the defered teardown above
 	if s.er, err = s.cmd.StderrPipe(); err != nil {
-		log.Fatal(err)
+		log.Fatal(fmt.Errorf("unable to read  setup command STDOUT; %w", err))
 	}
+
+
 	go func() {
 		rd := bufio.NewReader(s.er)
 		for {
@@ -112,7 +127,7 @@ waitForReady:
 	for {
 		str, err := rd.ReadString('\n')
 		if err != nil {
-			log.Fatal(err)
+			log.Fatal("Unable to read from setup script stdout. Cannot wait for pods")
 		}
 		fmt.Print(str)
 		if strings.HasPrefix(str, "FORWARD") {
@@ -141,4 +156,3 @@ waitForReady:
 	}()
 
 }
-

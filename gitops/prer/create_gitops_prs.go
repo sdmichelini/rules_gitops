@@ -38,6 +38,18 @@ func init() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 }
 
+// SliceFlags should be used with flags.Var to define a command line flag with multiple values
+type SliceFlags []string
+
+func (i *SliceFlags) String() string {
+	return "[" + strings.Join(*i, ",") + "]"
+}
+
+func (i *SliceFlags) Set(value string) error {
+	*i = append(*i, value)
+	return nil
+}
+
 var (
 	releaseBranch          = flag.String("release_branch", "master", "filter gitops targets by release branch")
 	bazelCmd               = flag.String("bazel_cmd", "tools/bazel", "bazel binary to use")
@@ -49,11 +61,23 @@ var (
 	target                 = flag.String("target", "//... except //experimental/...", "target to scan. Useful for debugging only")
 	pushParallelism        = flag.Int("push_parallelism", 5, "Number of image pushes to perform concurrently")
 	prInto                 = flag.String("gitops_pr_into", "master", "use this branch as the source branch and target for deployment PR")
+	prBody                 = flag.String("gitops_pr_body", "GitOps deployment <branch>", "a body message for deployment PR")
+	prTitle                = flag.String("gitops_pr_title", "GitOps deployment <branch>", "a title for deployment PR")
 	branchName             = flag.String("branch_name", "unknown", "Branch name to use in commit message")
 	gitCommit              = flag.String("git_commit", "unknown", "Git commit to use in commit message")
 	deploymentBranchSuffix = flag.String("deployment_branch_suffix", "", "suffix to add to all deployment branch names")
 	gitHost                = flag.String("git_server", "bitbucket", "the git server api to use. 'bitbucket', 'github' or 'gitlab'")
+	gitopsKind             SliceFlags
+	gitopsRuleName         SliceFlags
+	gitopsRuleAttr         SliceFlags
+	dryRun                 = flag.Bool("dry_run", false, "Do not create PRs, just print what would be done")
 )
+
+func init() {
+	flag.Var(&gitopsKind, "gitops_dependencies_kind", "dependency kind(s) to run during gitops phase. Can be specified multiple times. Default is 'k8s_container_push'")
+	flag.Var(&gitopsRuleName, "gitops_dependencies_name", "dependency name(s) to run during gitops phase. Can be specified multiple times. Default is empty")
+	flag.Var(&gitopsRuleAttr, "gitops_dependencies_attr", "dependency attribute(s) to run during gitops phase. Use attribute=value format. Can be specified multiple times. Default is empty")
+}
 
 func bazelQuery(query string) *analysis.CqueryResult {
 	log.Println("Executing bazel cquery ", query)
@@ -82,6 +106,9 @@ func main() {
 		if err := os.Chdir(*workspace); err != nil {
 			log.Fatal(err)
 		}
+	}
+	if len(gitopsKind) == 0 {
+		gitopsKind = []string{"k8s_container_push"}
 	}
 
 	var gitServer git.Server
@@ -170,7 +197,30 @@ func main() {
 	}
 
 	// Push images
-	qr = bazelQuery(fmt.Sprintf("kind(k8s_container_push, deps(%s))", strings.Join(updatedGitopsTargets, " + ")))
+
+	// Create space separated set('//a' '//b' ... '//z') of targets.
+	// Target names need to be quoted to protect from + and other special characters
+	depsList := "set('" + strings.Join(updatedGitopsTargets, "' '") + "')"
+	var qv []string
+	for _, kind := range gitopsKind {
+		q := fmt.Sprintf("kind(%s, deps(%s))", kind, depsList)
+		qv = append(qv, q)
+	}
+	for _, name := range gitopsRuleName {
+		q := fmt.Sprintf("filter(%s, deps(%s))", name, depsList)
+		qv = append(qv, q)
+	}
+	for _, attr := range gitopsRuleAttr {
+		name, value, found := strings.Cut(attr, "=")
+		if !found {
+			value = ".*"
+		}
+		q := fmt.Sprintf("attr(%s, %s, deps(%s))", name, value, depsList)
+		qv = append(qv, q)
+	}
+
+	query := strings.Join(qv, " union ")
+	qr = bazelQuery(query)
 	targetsCh := make(chan string)
 	var wg sync.WaitGroup
 	wg.Add(*pushParallelism)
@@ -189,10 +239,24 @@ func main() {
 	close(targetsCh)
 	wg.Wait()
 
-	workdir.Push(updatedGitopsBranches)
+	if *dryRun {
+		log.Println("dry-run: updated gitops branches: ", updatedGitopsBranches)
+		log.Println("dry-run: skipping push")
+	} else {
+		workdir.Push(updatedGitopsBranches)
+	}
 
 	for _, branch := range updatedGitopsBranches {
-		err := gitServer.CreatePR(branch, *prInto, fmt.Sprintf("GitOps deployment %s", branch))
+		if *dryRun {
+			log.Println("dry-run: skipping PR creation: branch ", branch, "into ", *prInto)
+			continue
+		}
+
+		if *prTitle == "" {
+			*prTitle = fmt.Sprintf("GitOps deployment %s", branch)
+		}
+
+		err := gitServer.CreatePR(branch, *prInto, *prTitle, *prBody)
 		if err != nil {
 			log.Fatal("unable to create PR: ", err)
 		}

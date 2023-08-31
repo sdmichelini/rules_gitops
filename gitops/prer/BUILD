@@ -8,9 +8,9 @@
 # OF ANY KIND, either express or implied. See the License for the specific language
 # governing permissions and limitations under the License.
 
-licenses(["notice"])  # Apache 2.0
-
 load("@io_bazel_rules_go//go:def.bzl", "go_binary", "go_library")
+
+licenses(["notice"])  # Apache 2.0
 
 go_library(
     name = "go_default_library",
@@ -26,7 +26,7 @@ go_library(
         "//gitops/git/bitbucket:go_default_library",
         "//gitops/git/github:go_default_library",
         "//gitops/git/gitlab:go_default_library",
-        "@com_github_golang_protobuf//proto:go_default_library",
+        "//vendor/github.com/golang/protobuf/proto:go_default_library",
     ],
 )
 

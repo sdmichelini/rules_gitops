@@ -12,6 +12,7 @@ exports_files([
     "run-all.sh.tpl",
     "kubectl.sh.tpl",
     "nameprefix_deployment_labels_config.yaml",
+    "namesuffix_deployment_labels_config.yaml",
 ])
 
 sh_binary(
@@ -21,4 +22,5 @@ sh_binary(
         "@kustomize_bin//:kustomize",
     ],
     visibility = ["//visibility:public"],
+    deps = ["@bazel_tools//tools/bash/runfiles"],
 )

@@ -32,47 +32,12 @@ Bazel GitOps Rules is an alternative to [rules_k8s](https://github.com/bazelbuil
 * [Integration Testing Support](#integration-testing-support)
 
 
-## Setup
+<a name="installation"></a>
+## Installation
 
-Add the following to your `WORKSPACE` file to add the necessary external dependencies:
-
-<!--
-# generate the WORKSPACE snippet:
-
-rev=$(git rev-parse HEAD) && sha265=$(curl -Ls https://github.com/adobe/rules_gitops/archive/${rev}.zip | shasum -a 256 - | cut -d ' ' -f1) && cat <<EOF
-# copy/paste following snippet into README.md
-rules_gitops_version = "${rev}"
-
-http_archive(
-    name = "com_adobe_rules_gitops",
-    sha256 = "${sha265}",
-    strip_prefix = "rules_gitops-%s" % rules_gitops_version,
-    urls = ["https://github.com/adobe/rules_gitops/archive/%s.zip" % rules_gitops_version],
-)
-EOF
--->
-
-```python
-load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
-
-rules_gitops_version = "01b16044b3ae3384d03a75f58d45218091ad1ba5"
-
-http_archive(
-    name = "com_adobe_rules_gitops",
-    sha256 = "4921c8f7fab5f16240f39bc67b10a1dce9f7c63eda54ceb7b97b88251ad7bdaf",
-    strip_prefix = "rules_gitops-%s" % rules_gitops_version,
-    urls = ["https://github.com/adobe/rules_gitops/archive/%s.zip" % rules_gitops_version],
-)
-
-load("@com_adobe_rules_gitops//gitops:deps.bzl", "rules_gitops_dependencies")
-
-rules_gitops_dependencies()
-
-load("@com_adobe_rules_gitops//gitops:repositories.bzl", "rules_gitops_repositories")
-
-rules_gitops_repositories()
-
-```
+From the release you wish to use:
+<https://github.com/adobe/rules_gitops/releases>
+copy the WORKSPACE snippet into your `WORKSPACE` file.
 
 
 <a name="k8s_deploy"></a>
@@ -117,6 +82,7 @@ When you run `bazel run ///helloworld:mynamespace.apply`, it applies this file i
 | ***image_registry***      | `docker.io`    | The registry to push images to.
 | ***image_repository***    | `None`         | The repository to push images to. By default, this is generated from the current package path.
 | ***image_repository_prefix*** | `None`     | Add a prefix to the image_repository. Can be used to upload the images in
+| ***image_pushes***        | `[]`           | A list of labels implementing K8sPushInfo referring image uploaded into registry. See [Injecting Docker Images](#injecting-docker-images).
 | ***release_branch_prefix*** | `master`     | A git branch name/prefix. Automatically run GitOps while building this branch. See [GitOps and Deployment](#gitops_and_deployment).
 | ***deployment_branch***   | `None`         | Automatic GitOps output will appear in a branch and PR with this name. See [GitOps and Deployment](#gitops_and_deployment).
 | ***gitops_path***         | `cloud`        | Path within the git repo where gitops files get generated into
@@ -133,7 +99,7 @@ The base manifests will be modified by most of the other `k8s_deploy` attributes
 To demonstrate, let's go over hypothetical multi cluster deployment.
 
 Here is the fragment of the `k8s_deploy` rule that is responsible for generating manifest variants per CLOUD, CLUSTER, and NAMESPACE :
-```python
+```starlark
 k8s_deploy(
     ...
     manifests = glob([                 # (1)
@@ -194,7 +160,7 @@ That looks like a lot. But lets try to decode what is happening here:
 
 Configmaps are a special case of manifests. They can be rendered from a collection of files of any kind (.yaml, .properties, .xml, .sh, whatever). Let's use hypothetical Grafana deployment as an example:
 
-```python
+```starlark
 [
     k8s_deploy(
         name = NAME,
@@ -266,7 +232,7 @@ spec:
 Third-party Docker images can be referenced directly in K8s manifests, but for most apps, we need to run our own images. The images are built in the Bazel build pipeline using [rules_docker](https://github.com/bazelbuild/rules_docker). For example, the `java_image` rule creates an image of a Java application from Java source code, dependencies, and configuration.
 
 Here's a (very contrived) example of how this ties in with `k8s_deploy`. Here's the `BUILD` file located in the package `//examples`:
-```python
+```starlark
 java_image(
     name = "helloworld_image",
     srcs = glob(["*.java"]),
@@ -349,6 +315,25 @@ Docker image and the files in the image. So for example, here's what will happen
 1. A new `helloworld` manifest will be rendered using the new image
 1. The new `helloworld` pod will be deployed
 
+It is possible to use alternative ways to resolve images as long as respective rule implements K8sPushInfo provider. For example, this setup will mirror the referred image into a local registry and provide a reference to it. `k8s_deploy` will need to use `image_pushes` parameter:
+
+```starlark
+load("@com_fasterci_rules_mirror//mirror:defs.bzl", "mirror_image")
+mirror_image(
+    name = "agnhost_image",
+    digest = "sha256:93c166faf53dba3c9c4227e2663ec1247e2a9a193d7b59eddd15244a3e331c3e",
+    dst_prefix = "gcr.io/myregistry/mirror",
+    src_image = "registry.k8s.io/e2e-test-images/agnhost:2.39",
+)
+k8s_deploy(
+    name = "agnhost",
+    manifests = ["agnhost.yaml"],
+    image_pushes = [
+        ":agnhost_image",
+    ]
+)
+```
+
 
 <a name="adding-dependencies"></a>
 ### Adding Dependencies
@@ -357,7 +342,7 @@ Many instances of `k8s_deploy` include an `objects` attribute that references ot
 `k8s_deploy`. When chained this way, running the `.apply` will also apply any dependencies as well.
 
 For example, to add dependency to the example [helloworld deployment](./examples/helloworld/BUILD):
-```python
+```starlark
 k8s_deploy(
     name = "mynamespace",
     objects = [
@@ -427,6 +412,8 @@ if [ "${GIT_BRANCH_NAME}" == "master"]; then
         --git_server github \
         --release_branch master \
         --gitops_pr_into master \
+        --gitops_pr_title "This is my pull request title" \
+        --gitops_pr_body "This is my pull request body message" \
         --branch_name ${GIT_BRANCH_NAME} \
         --git_commit ${GIT_COMMIT_ID} \
 fi
@@ -443,7 +430,7 @@ The `create_gitops_prs` tool will query all `gitops` targets which have set the 
 The all discovered `gitops` targets are grouped by the value of ***deploy_branch*** attribute. The one deployment branch will accumulate the output of all corresponding `gitops` targets.
 
 For example, we define two deployments: grafana and prometheus. Both deployments share the same namespace. The deployments a grouped by namespace.
-```python
+```starlark
 [
     k8s_deploy(
         name = NAME,
@@ -476,6 +463,8 @@ As a result of the setup above the `create_gitops_prs` tool will open up to 2 po
 
 The GitOps pull request is only created (or new commits added) if the `gitops` target changes the state for the target deployment branch. The source pull request will remain open (and keep accumulation GitOps results) until the pull request is merged and source branch is deleted.
 
+`--dry_run` parameter can be used to test the tool without creating any pull requests. The tool will print the list of the potential pull requests. It is recommended to run the tool in the dry run mode as a part of the CI test suite to verify that the tool is configured correctly.
+
 <a name="multiple-release-branches-gitops-workflow"></a>
 ## Multiple Release Branches GitOps Workflow
 
@@ -501,6 +490,8 @@ if [ "${RELEASE_BRANCH}" == "release/team"]; then
         --release_branch ${RELEASE_BRANCH} \
         --deployment_branch_suffix=${RELEASE_BRANCH_SUFFIX} \
         --gitops_pr_into master \
+        --gitops_pr_title "This is my pull request title" \
+        --gitops_pr_body "This is my pull request body message" \
         --branch_name ${GIT_BRANCH_NAME} \
         --git_commit ${GIT_COMMIT_ID} \
 fi
@@ -510,7 +501,7 @@ The meaning of the parameters is the same as with [trunk based workflow](#trunk_
 The `--release_branch` parameter takes the value of `release/team`. The additional parameter `--deployment_branch_suffix` will add the release branch suffix to the target deployment branch name.
 
 If we modify previous example:
-```python
+```starlark
 [
     k8s_deploy(
         name = NAME,
@@ -550,7 +541,7 @@ The result of the setup above the `create_gitops_prs` tool will open up to 2 pot
 **Note:** the Integration testing support has known limitations and should be considered **experimental**. The public API is subject to change.
 
 Integration tests are defined in `BUILD` files like this:
-```python
+```starlark
 k8s_test_setup(
     name = "service_it.setup",
     kubeconfig = "@k8s_test//:kubeconfig",
@@ -583,7 +574,7 @@ The test code launches the script to perform the test setup. The test code shoul
 
 The `@k8s_test//:kubeconfig` target referenced from `k8s_test_setup` rule serves the purpose of making Kubernetes configuration available in the test sandbox. The `kubeconfig` repository rule in the `WORKSPACE` file will need, at minimum, provide the cluster name.
 
-```python
+```starlark
 load("@com_adobe_rules_gitops//gitops:defs.bzl", "kubeconfig")
 
 kubeconfig(
@@ -653,7 +644,8 @@ Contributions are welcomed! Read the [Contributing Guide](./.github/CONTRIBUTING
 ## Adopters
 Here's a (non-exhaustive) list of companies that use `rules_gitops` in production. Don't see yours? [You can add it in a PR!](https://github.com/adobe/rules_gitops/edit/master/README.md)
   * [Adobe (Advertising Cloud)](https://www.adobe.com/advertising/adobe-advertising-cloud.html)
-
+  * [FasterCI](https://fasterci.com)
+  * [Skydio](https://www.skydio.com)
 
 ## Licensing
 

@@ -29,19 +29,70 @@ load(
     "runfile",
 )
 
-K8sPushInfo = provider(fields = [
-    "image_label",
-    "legacy_image_name",
-    "registry",
-    "repository",
-    "digestfile",
-])
+K8sPushInfo = provider(
+    "Information required to inject image into a manifest",
+    fields = [
+        "image_label",  # bazel target label of the image
+        "legacy_image_name",  # optional short name
+        "registry",
+        "repository",
+        "digestfile",
+    ],
+)
 
 def _get_runfile_path(ctx, f):
     return "${RUNFILES}/%s" % runfile(ctx, f)
 
 def _impl(ctx):
     """Core implementation of container_push."""
+
+    if K8sPushInfo in ctx.attr.image:
+        # the image was already pushed, just rename if needed. Ignore registry and repository parameters
+        kpi = ctx.attr.image[K8sPushInfo]
+        if ctx.attr.image[DefaultInfo].files_to_run.executable:
+            ctx.actions.expand_template(
+                template = ctx.file._tag_tpl,
+                substitutions = {
+                    "%{args}": "",
+                    "%{container_pusher}": _get_runfile_path(ctx, ctx.attr.image[DefaultInfo].files_to_run.executable),
+                },
+                output = ctx.outputs.executable,
+                is_executable = True,
+            )
+        else:
+            ctx.actions.write(
+                content = "#!/bin/bash\n",
+                output = ctx.outputs.executable,
+                is_executable = True,
+            )
+
+        runfiles = ctx.runfiles(files = []).merge(ctx.attr.image[DefaultInfo].default_runfiles)
+
+        ctx.actions.run_shell(
+            tools = [kpi.digestfile],
+            outputs = [ctx.outputs.digest],
+            command = "cp -f \"$1\" \"$2\"",
+            arguments = [kpi.digestfile.path, ctx.outputs.digest.path],
+            mnemonic = "CopyFile",
+            progress_message = "Copying files",
+            use_default_shell_env = True,
+            execution_requirements = {"no-remote": "1", "no-cache": "1"},  # It is is more efficient to locally copy file (which may come from the cache) rather than talk to remote cache. See https://github.com/aspect-build/bazel-lib/blob/e9b66b5e0a11946853c20ad4781abc077ba2a9fe/lib/private/copy_common.bzl#L4 for the
+        )
+
+        return [
+            # we need to provide executable that calls the actual pusher
+            DefaultInfo(
+                executable = ctx.outputs.executable,
+                runfiles = runfiles,
+            ),
+            K8sPushInfo(
+                image_label = kpi.image_label,
+                legacy_image_name = ctx.attr.legacy_image_name,  # this is the only difference
+                registry = kpi.registry,
+                repository = kpi.repository,
+                digestfile = kpi.digestfile,
+            ),
+        ]
 
     # TODO: Possible optimization for efficiently pushing intermediate format after container_image is refactored, similar with the old python implementation, e.g., push-by-layer.
 
@@ -82,7 +133,7 @@ def _impl(ctx):
     pusher_runfiles = [ctx.executable._pusher] + pusher_input
 
     if ctx.attr.skip_unchanged_digest:
-        pusher_args += ["-skip-unchanged-digest"]
+        pusher_args.append("-skip-unchanged-digest")
     digester_args += ["--dst", str(ctx.outputs.digest.path), "--format", str(ctx.attr.format)]
     ctx.actions.run(
         inputs = digester_input,
@@ -95,7 +146,7 @@ def _impl(ctx):
 
     if ctx.attr.image_digest_tag:
         tag = "$(cat {} | cut -d ':' -f 2 | cut -c 1-7)".format(_get_runfile_path(ctx, ctx.outputs.digest))
-        pusher_runfiles += [ctx.outputs.digest]
+        pusher_runfiles.append(ctx.outputs.digest)
 
     pusher_args.append("--format={}".format(ctx.attr.format))
     pusher_args.append("--dst={registry}/{repository}:{tag}".format(
@@ -131,9 +182,6 @@ def _impl(ctx):
         PushInfo(
             registry = registry,
             repository = repository,
-            tag = tag,
-            stamp = stamp,
-            stamp_inputs = stamp_inputs,
             digest = image["digest"],
         ),
         K8sPushInfo(
@@ -172,7 +220,8 @@ Args:
             doc = "The form to push: Docker or OCI, default to 'Docker'.",
         ),
         "image": attr.label(
-            allow_single_file = [".tar"],
+            # allow_single_file = [".tar"],
+            # providers = [K8sPushInfo],
             mandatory = True,
             doc = "The label of the image to push.",
         ),
@@ -215,12 +264,12 @@ Args:
         ),
         "_digester": attr.label(
             default = "@io_bazel_rules_docker//container/go/cmd/digester",
-            cfg = "host",
+            cfg = "exec",
             executable = True,
         ),
         "_pusher": attr.label(
             default = "@io_bazel_rules_docker//container/go/cmd/pusher",
-            cfg = "host",
+            cfg = "exec",
             executable = True,
             allow_files = True,
         ),

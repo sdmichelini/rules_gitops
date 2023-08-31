@@ -25,9 +25,6 @@ load("//skylib:push.bzl", "k8s_container_push")
 def _runfiles(ctx, f):
     return "${RUNFILES}/%s" % _get_runfile_path(ctx, f)
 
-def _python_runfiles(ctx, f):
-    return "PYTHON_RUNFILES=${RUNFILES} %s" % _runfiles(ctx, f)
-
 def _show_impl(ctx):
     script_content = "#!/usr/bin/env bash\nset -e\n"
 
@@ -67,7 +64,7 @@ show = rule(
         "_template_engine": attr.label(
             default = Label("//templating:fast_template_engine"),
             executable = True,
-            cfg = "host",
+            cfg = "exec",
         ),
     },
     executable = True,
@@ -75,27 +72,38 @@ show = rule(
 
 def _image_pushes(name_suffix, images, image_registry, image_repository, image_repository_prefix, image_digest_tag, image_tag):
     image_pushes = []
-    for image_name in images:
-        image = images[image_name]
-        rule_name_parts = []
-        rule_name_parts.append(image_registry)
-        if image_repository:
-            rule_name_parts.append(image_repository)
-        rule_name_parts.append(image_name)
-        rule_name = "-".join(rule_name_parts)
-        rule_name = rule_name.replace("/", "-").replace(":", "-")
-        image_pushes.append(rule_name + name_suffix)
+
+    def process_image(image_label, legacy_name = None):
+        rule_name_parts = [image_label, image_registry, image_repository, legacy_name]
+        rule_name_parts = [p for p in rule_name_parts if p]
+        rule_name = "_".join(rule_name_parts)
+        rule_name = rule_name.replace("/", "_").replace(":", "_").replace("@", "_")
+        if rule_name.startswith("_"):
+            rule_name = rule_name[1:]
+        if rule_name.startswith("_"):
+            rule_name = rule_name[1:]
         if not native.existing_rule(rule_name + name_suffix):
             k8s_container_push(
                 name = rule_name + name_suffix,
-                image = image,
+                image = image_label,  # buildifier: disable=uninitialized
                 image_digest_tag = image_digest_tag,
-                legacy_image_name = image_name,
+                legacy_image_name = legacy_name,
                 registry = image_registry,
                 repository = image_repository,
                 repository_prefix = image_repository_prefix,
                 tag = image_tag,
             )
+        return rule_name + name_suffix
+
+    if type(images) == "dict":
+        for image_name in images:
+            image = images[image_name]
+            push = process_image(image, image_name)
+            image_pushes.append(push)
+    else:
+        for image in images:
+            push = process_image(image)
+            image_pushes.append(push)
     return image_pushes
 
 def k8s_deploy(
@@ -119,7 +127,7 @@ def k8s_deploy(
         common_annotations = {},  # list of common annotations to apply to all objects see commonAnnotations kustomize docs
         deps = [],
         deps_aliases = {},
-        images = {},
+        images = [],
         image_digest_tag = False,
         image_registry = "docker.io",  # registry to push container to. jenkins will need an access configured for gitops to work. Ignored for mynamespace.
         image_repository = None,  # repository (registry path) to push container to. Generated from the image bazel path if empty.
@@ -129,8 +137,7 @@ def k8s_deploy(
         gitops = True,  # make sure to use gitops = False to work with individual namespace. This option will be turned False if namespace is '{BUILD_USER}'
         gitops_path = "cloud",
         deployment_branch = None,
-        release_branch_prefix = "master",
-        flatten_manifest_directories = False,
+        release_branch_prefix = "main",
         start_tag = "{{",
         end_tag = "}}",
         visibility = None):
@@ -140,7 +147,10 @@ def k8s_deploy(
     if not manifests:
         manifests = native.glob(["*.yaml", "*.yaml.tpl"])
     if prefix_suffix_app_labels:
-        configurations = configurations + ["@com_adobe_rules_gitops//skylib/kustomize:nameprefix_deployment_labels_config.yaml"]
+        configurations = configurations + [
+            "@com_adobe_rules_gitops//skylib/kustomize:nameprefix_deployment_labels_config.yaml",
+            "@com_adobe_rules_gitops//skylib/kustomize:namesuffix_deployment_labels_config.yaml",
+        ]
     for reservedname in ["CLUSTER", "NAMESPACE"]:
         if substitutions.get(reservedname):
             fail("do not put %s in substitutions parameter of k8s_deploy. It will be added autimatically" % reservedname)
@@ -302,6 +312,7 @@ def _kubeconfig_impl(repository_ctx):
     if not kubectl:
         fail("Unable to find kubectl executable. PATH=%s" % repository_ctx.path)
     repository_ctx.symlink(kubectl, "kubectl")
+    repository_ctx.file(repository_ctx.path("cluster"), content = repository_ctx.attr.cluster, executable = False)
 
     # TODO: figure out how to use BUILD_USER
     if "USER" in repository_ctx.os.environ:
@@ -337,6 +348,18 @@ def _kubeconfig_impl(repository_ctx):
         else:
             # fall back to the default
             server = "https://kubernetes.default"
+    elif repository_ctx.attr.use_host_config:
+        home = repository_ctx.path(repository_ctx.os.environ["HOME"])
+        kubeconfig = home.get_child(".kube").get_child("config")
+        if repository_ctx.path(kubeconfig).exists:
+            repository_ctx.symlink(kubeconfig, repository_ctx.path("kubeconfig"))
+        else:
+            _kubectl_config(repository_ctx, [
+                "set-cluster",
+                repository_ctx.attr.cluster,
+                "--server",
+                server,
+            ])
     else:
         home = repository_ctx.path(repository_ctx.os.environ["HOME"])
         certs = home.get_child(".kube").get_child("certs")
@@ -348,14 +371,15 @@ def _kubeconfig_impl(repository_ctx):
     #     --certificate-authority=... \
     #     --server=https://dev3.k8s.tubemogul.info:443 \
     #     --embed-certs",
-    _kubectl_config(repository_ctx, [
-        "set-cluster",
-        repository_ctx.attr.cluster,
-        "--server",
-        server,
-        "--certificate-authority",
-        ca_crt,
-    ])
+    if ca_crt:
+        _kubectl_config(repository_ctx, [
+            "set-cluster",
+            repository_ctx.attr.cluster,
+            "--server",
+            server,
+            "--certificate-authority",
+            ca_crt,
+        ])
 
     # config set-credentials {user} --token=...",
     if token:
@@ -385,17 +409,20 @@ def _kubeconfig_impl(repository_ctx):
         ])
 
     # export repostory contents
-    repository_ctx.file("BUILD", """exports_files(["kubeconfig", "kubectl"])""", False)
+    repository_ctx.file("BUILD", """exports_files(["kubeconfig", "kubectl", "cluster"])""", False)
 
     return {
+        "name": repository_ctx.attr.name,
         "cluster": repository_ctx.attr.cluster,
         "server": repository_ctx.attr.server,
+        "use_host_config": repository_ctx.attr.use_host_config,
     }
 
 kubeconfig = repository_rule(
     attrs = {
         "cluster": attr.string(),
         "server": attr.string(),
+        "use_host_config": attr.bool(),
     },
     environ = [
         "HOME",
@@ -405,78 +432,6 @@ kubeconfig = repository_rule(
     ],
     local = True,
     implementation = _kubeconfig_impl,
-)
-
-def _stamp(ctx, string, output):
-    stamps = [ctx.file._info_file]
-    stamp_args = [
-        "--stamp-info-file=%s" % sf.path
-        for sf in stamps
-    ]
-    ctx.actions.run(
-        executable = ctx.executable._stamper,
-        arguments = [
-            "--format=%s" % string,
-            "--output=%s" % output.path,
-        ] + stamp_args,
-        inputs = [ctx.executable._stamper] + stamps,
-        outputs = [output],
-        mnemonic = "Stamp",
-    )
-
-def _k8s_cmd_impl(ctx):
-    files = [ctx.executable._stamper, ctx.file.kubectl, ctx.file.kubeconfig]
-
-    # replace placeholders in the parameter value
-    # see: https://github.com/bazelbuild/rules_docker#stamping
-    command_arg = ctx.expand_make_variables("command", ctx.attr.command, {})
-    if "{" in ctx.attr.command:
-        command_file = ctx.actions.declare_file(ctx.label.name + ".command")
-        _stamp(ctx, ctx.attr.command, command_file)
-        command_arg = "source %s" % _runfiles(ctx, command_file)
-        files += [command_file]
-
-    ctx.actions.expand_template(
-        template = ctx.file._template,
-        substitutions = {
-            "%{kubeconfig}": ctx.file.kubeconfig.path,
-            "%{kubectl}": ctx.file.kubectl.path,
-            "%{statements}": command_arg,
-        },
-        output = ctx.outputs.executable,
-    )
-    return [
-        DefaultInfo(runfiles = ctx.runfiles(files = files)),
-    ]
-
-_k8s_cmd = rule(
-    attrs = {
-        "command": attr.string(),
-        "kubeconfig": attr.label(
-            allow_single_file = True,
-        ),
-        "kubectl": attr.label(
-            cfg = "host",
-            executable = True,
-            allow_single_file = True,
-        ),
-        "_info_file": attr.label(
-            default = Label("//skylib:more_stable_status.txt"),
-            allow_single_file = True,
-        ),
-        "_stamper": attr.label(
-            default = Label("//stamper:stamper"),
-            cfg = "host",
-            executable = True,
-            allow_files = True,
-        ),
-        "_template": attr.label(
-            default = Label("//skylib:k8s_cmd.sh.tpl"),
-            allow_single_file = True,
-        ),
-    },
-    executable = True,
-    implementation = _k8s_cmd_impl,
 )
 
 def _k8s_test_namespace_impl(ctx):
@@ -496,7 +451,7 @@ def _k8s_test_namespace_impl(ctx):
         output = namespace_create,
         is_executable = True,
     )
-    files += [namespace_create]
+    files.append(namespace_create)
 
     return [DefaultInfo(
         executable = namespace_create,
@@ -509,7 +464,7 @@ k8s_test_namespace = rule(
             allow_single_file = True,
         ),
         "kubectl": attr.label(
-            cfg = "host",
+            cfg = "exec",
             executable = True,
             allow_single_file = True,
         ),
@@ -530,6 +485,7 @@ def _k8s_test_setup_impl(ctx):
     # add files referenced by rule attributes to runfiles
     files = [ctx.executable._stamper, ctx.file.kubectl, ctx.file.kubeconfig, ctx.executable._kustomize, ctx.executable._it_sidecar, ctx.executable._it_manifest_filter]
     files += ctx.files._set_namespace
+    files += ctx.files.cluster
 
     push_statements, files, pushes_runfiles = imagePushStatements(ctx, [o for o in ctx.attr.objects if KustomizeInfo in o], files)
 
@@ -537,22 +493,23 @@ def _k8s_test_setup_impl(ctx):
     for obj in ctx.attr.objects:
         if obj.files_to_run.executable:
             # add object' targets and excutables to runfiles
-            files += [obj.files_to_run.executable]
+            files.append(obj.files_to_run.executable)
             transitive.append(obj.default_runfiles.files)
 
             # add object' execution command
-            commands += [_runfiles(ctx, obj.files_to_run.executable) + " | ${SET_NAMESPACE} $NAMESPACE | ${IT_MANIFEST_FILTER} | ${KUBECTL} apply -f -"]
+            commands.append(_runfiles(ctx, obj.files_to_run.executable) + " | ${SET_NAMESPACE} $NAMESPACE | ${IT_MANIFEST_FILTER} | ${KUBECTL} apply -f -")
         else:
             files += obj.files.to_list()
             commands += [ctx.executable._template_engine.short_path + " --template=" + filename.short_path + " --variable=NAMESPACE=${NAMESPACE} | ${SET_NAMESPACE} $NAMESPACE | ${IT_MANIFEST_FILTER} | ${KUBECTL} apply -f -" for filename in obj.files.to_list()]
 
-    files += [ctx.executable._template_engine]
+    files.append(ctx.executable._template_engine)
 
     # create namespace script
     ctx.actions.expand_template(
         template = ctx.file._namespace_template,
         substitutions = {
             "%{it_sidecar}": ctx.executable._it_sidecar.short_path,
+            "%{cluster}": ctx.file.cluster.path,
             "%{kubeconfig}": ctx.file.kubeconfig.path,
             "%{kubectl}": ctx.file.kubectl.path,
             "%{portforwards}": " ".join(["-portforward=" + p for p in ctx.attr.portforward_services]),
@@ -567,6 +524,7 @@ def _k8s_test_setup_impl(ctx):
     )
 
     rf = ctx.runfiles(files = files, transitive_files = depset(transitive = transitive))
+    rf = rf.merge(ctx.attr._set_namespace[DefaultInfo].default_runfiles)
     for dep_rf in pushes_runfiles:
         rf = rf.merge(dep_rf)
     return [DefaultInfo(
@@ -582,7 +540,7 @@ k8s_test_setup = rule(
         ),
         "kubectl": attr.label(
             default = Label("@k8s_test//:kubectl"),
-            cfg = "host",
+            cfg = "exec",
             executable = True,
             allow_single_file = True,
         ),
@@ -592,14 +550,18 @@ k8s_test_setup = rule(
         "portforward_services": attr.string_list(),
         "setup_timeout": attr.string(default = "10m"),
         "wait_for_apps": attr.string_list(),
+        "cluster": attr.label(
+            default = Label("@k8s_test//:cluster"),
+            allow_single_file = True,
+        ),
         "_it_sidecar": attr.label(
             default = Label("//testing/it_sidecar:it_sidecar"),
-            cfg = "host",
+            cfg = "exec",
             executable = True,
         ),
         "_kustomize": attr.label(
             default = Label("@kustomize_bin//:kustomize"),
-            cfg = "host",
+            cfg = "exec",
             executable = True,
         ),
         "_namespace_template": attr.label(
@@ -608,24 +570,24 @@ k8s_test_setup = rule(
         ),
         "_set_namespace": attr.label(
             default = Label("//skylib/kustomize:set_namespace"),
-            cfg = "host",
+            cfg = "exec",
             executable = True,
         ),
         "_it_manifest_filter": attr.label(
             default = Label("//testing/it_manifest_filter:it_manifest_filter"),
-            cfg = "host",
+            cfg = "exec",
             executable = True,
         ),
         "_stamper": attr.label(
             default = Label("//stamper:stamper"),
-            cfg = "host",
+            cfg = "exec",
             executable = True,
             allow_files = True,
         ),
         "_template_engine": attr.label(
             default = Label("//templating:fast_template_engine"),
             executable = True,
-            cfg = "host",
+            cfg = "exec",
         ),
     },
     executable = True,
